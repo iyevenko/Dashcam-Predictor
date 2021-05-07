@@ -9,15 +9,15 @@ import dashcam_predictor.dataset as ds
 import cv2
 
 w, h = (160, 90)
-LOOKBACK_AMT = 8
+BUF_SIZE = 8
 
 loaded_model = tf.keras.models.load_model(model.SAVE_MODEL_PATH)
 
-frame_buffer = deque(maxlen=LOOKBACK_AMT)
+frame_buffer = deque(maxlen=BUF_SIZE)
 video_path = os.path.join(ds.DATA_PATH, os.listdir(ds.DATA_PATH)[0])
 capture = cv2.VideoCapture(video_path)
 
-for i in range(LOOKBACK_AMT):
+for i in range(BUF_SIZE):
     _, frame = capture.read()
     frame_tensor = tf.convert_to_tensor(frame)
     frame_tensor = tf.image.rot90(frame_tensor)
@@ -45,5 +45,4 @@ while True:
     frame_tensor = tf.image.rot90(frame_tensor)
     frame_tensor = tf.image.resize(frame_tensor, (h, w))
     frame_tensor = frame_tensor / 255.0
-    frame_buffer.popleft()
     frame_buffer.append(frame_tensor)

@@ -1,90 +1,193 @@
+import os
 from collections import deque
 
 import cv2
-import tensorflow as tf
-import os
 import matplotlib.pyplot as plt
-import time
 import numpy as np
+import tensorflow as tf
 
+DATA_PATH = os.path.join('data', 'bdd100k', 'videos')
 
+def windowed_mov_ds(video_path, window_size, num_frames=100, skip_frames=1):
+    cap = cv2.VideoCapture(video_path)
+    frameCount = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    num_frames = min(num_frames, frameCount)
+    # print(f'Frame count: {frameCount}')
+    frameWidth = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frameHeight = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-def predictor_dataset_fn(batch_size=16, lookback_amount=10, resolution=(160, 90), num_files=1):
-    DATA_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'bdd100k', 'videos', 'train')
+    print('Allocating video memory')
+    buf = np.empty((num_frames, frameHeight, frameWidth, 3), np.dtype('uint8'))
 
-    w, h = resolution
+    fc = 0
+    ret = True
+    print('Reading frames')
+    while (fc < num_frames and ret):
+        ret, buf[fc] = cap.read()
+        fc += 1
 
-    files = os.listdir(DATA_PATH)
-    num_files = min(num_files, len(files))
-    files = files[:num_files]
-
+    @tf.function
     def process_frame(frame):
-        frame_tensor = tf.convert_to_tensor(frame)
-        frame_tensor = tf.image.rot90(frame_tensor)
-        frame_tensor = tf.image.resize(frame_tensor, (h, w))
-        frame_tensor = frame_tensor / 255.0
-        return frame_tensor
+        frame = tf.image.rot90(frame)
+        frame = tf.reverse(frame, axis=[-1])
+        frame = tf.image.resize(frame, size=[224, 224])
+        frame = frame / 255
+        return frame
 
-    def init_buffer(capture):
-        frame_buffer = deque(lookback_amount)
-        for i in range(lookback_amount):
-            _, frame = capture.read()
-            frame_buffer.append(process_frame(frame))
+    print('Creating dataset')
+    video_tensor = tf.map_fn(process_frame, buf, fn_output_signature=tf.float32)
+    ds = tf.data.Dataset.from_tensor_slices(video_tensor)
 
-        return frame_buffer
+    ds = ds.window(size=window_size, shift=skip_frames, stride=skip_frames, drop_remainder=True)
+    ds = ds.flat_map(lambda x: x.batch(window_size))
+    prev = ds.map(lambda x: x[:-1,...])
+    next = ds.map(lambda x: x[-1,...])
+    ds = tf.data.Dataset.zip((prev, next))
+    return ds
 
-    def generator():
-        video_idx = 0
-        capture = cv2.VideoCapture(files[video_idx])
-        grabbed = False
-        frame_buffer = None
+def dataset_from_mov(batch_size, window_size, train_file_num=None, val_file_num=None, test_file_num=None):
+    train_files = os.listdir(os.path.join(DATA_PATH, 'train'))[:train_file_num]
+    val_files = os.listdir(os.path.join(DATA_PATH, 'val'))[:val_file_num]
+    test_files = os.listdir(os.path.join(DATA_PATH, 'test'))[:test_file_num]
 
-        while True:
-            if not grabbed:
-                if video_idx >= num_files:
-                    break
-                capture = cv2.VideoCapture(files[video_idx])
-                frame_buffer = init_buffer(capture)
-                video_idx += 1
+    train_ds = None
+    val_ds = None
+    test_ds = None
 
-            grabbed, frame = capture.read()
+    for video in train_files:
+        ds = windowed_mov_ds(os.path.join(DATA_PATH, 'train', 'raw', video), window_size)
+        if train_ds is None:
+            train_ds = ds
+        else:
+            train_ds = train_ds.concatenate(ds)
+        del ds
 
-            X = tf.stack(frame_buffer)
-            Y = process_frame(frame)
+    for video in val_files:
+        ds = windowed_mov_ds(os.path.join(DATA_PATH, 'val', 'raw', video), window_size)
+        if val_ds is None:
+            val_ds = ds
+        else:
+            val_ds = val_ds.concatenate(ds)
+        del ds
 
-            yield (X, Y)
+    for video in test_files:
+        ds = windowed_mov_ds(os.path.join(DATA_PATH, 'test', 'raw', video), window_size)
+        if test_ds is None:
+            test_ds = ds
+        else:
+            test_ds = test_ds.concatenate(ds)
+        del ds
 
-            frame_buffer.popleft()
-            frame_buffer.append(output)
+    if train_ds is not None:
+        train_ds = train_ds.shuffle(10000).batch(batch_size, drop_remainder=True)
+    if val_ds is not None:
+        val_ds = val_ds.shuffle(10000).batch(batch_size, drop_remainder=True)
+    if test_ds is not None:
+        test_ds = test_ds.batch(batch_size, drop_remainder=True)
 
-    dataset = tf.data.Dataset.from_generator(generator=generator,
-                                             output_types=(tf.float16, tf.float16),
-                                             output_shapes=([lookback_amount, h, w, 3], [h, w, 3]))
-    # dataset = dataset.shuffle(100)
-    dataset = dataset.batch(batch_size, drop_remainder=True)
-
-    dataset_size = num_files * (1210 - lookback_amount)
-    train_size = int(0.8 * int(dataset_size / batch_size))
-    train_set = dataset.take(train_size)
-    test_set = dataset.skip(train_size)
-
-    partitions = {
-        'train': train_set,
-        'test': test_set
+    dataset = {
+        'train': train_ds,
+        'val': val_ds,
+        'test': test_ds
     }
-    return partitions
+
+    return dataset
+
+def plot_frames(frames):
+    window_size = frames.shape[0]
+    fig = plt.figure(figsize=(2*window_size, 2))
+    for i in range(window_size):
+        fig.add_subplot(1, window_size, i+1)
+        plt.tick_params(axis='x', bottom=False, labelbottom=False)
+        plt.tick_params(axis='y', left=False, labelleft=False)
+        plt.imshow(frames[i])
+
+    plt.show()
+
+def extract_jpgs(data_path):
+    mov_path = os.path.join(data_path, 'raw')
+    jpg_path = os.path.join(data_path, 'frames')
+    mov_files = os.listdir(mov_path)
+
+    for mov in mov_files:
+        cap = cv2.VideoCapture(os.path.join(mov_path, mov))
+        frame_dir = os.path.join(jpg_path, mov.split(os.extsep)[0])
+        if not os.path.exists(frame_dir):
+            os.mkdir(frame_dir)
+
+        count = 0
+        success, frame = cap.read()
+        while success:
+            frame_path = os.path.join(frame_dir, f'frame_{count:04}.jpg')
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            cv2.imwrite(frame_path, frame)
+
+            success, frame = cap.read()
+            count += 1
+
+        cap.release()
+
+def dataset_from_jpgs(batch_size, window_size):
+    train_path = os.path.join(DATA_PATH, 'train', 'frames')
+    train_videos = [os.path.join(train_path, vid, '*.jpg') for vid in os.listdir(train_path)]
+    train_ds = tf.data.Dataset.from_tensor_slices(train_videos)
+
+    val_path = os.path.join(DATA_PATH, 'val', 'frames')
+    val_videos = [os.path.join(val_path, vid, '*.jpg') for vid in os.listdir(val_path)]
+    val_ds = tf.data.Dataset.from_tensor_slices(val_videos)
+
+    test_path = os.path.join(DATA_PATH, 'test', 'frames')
+    test_videos = [os.path.join(test_path, vid, '*.jpg') for vid in os.listdir(test_path)]
+    test_ds = tf.data.Dataset.from_tensor_slices(test_videos)
+
+    @tf.function
+    def filename_to_frame_tensor(frame_file):
+        frame_str = tf.io.read_file(frame_file)
+        decoded_frame = tf.image.decode_jpeg(frame_str, channels=3)
+        resized_image = tf.image.resize(decoded_frame, [224, 224])
+        rescaled_image = resized_image / 255
+        return rescaled_image
+
+    @tf.function
+    def make_windows(frames_dir):
+        files_ds = tf.data.Dataset.list_files(frames_dir, shuffle=False)
+        files_ds = files_ds.map(filename_to_frame_tensor)
+        window_ds = files_ds.window(window_size, 2, 2)
+        window_ds = window_ds.flat_map(lambda x: x.batch(window_size))
+        prev = window_ds.map(lambda x: x[:-1,...])
+        next = window_ds.map(lambda x: x[-1,...])
+        window_ds = tf.data.Dataset.zip((prev, next))
+        return window_ds
+
+    train_ds = train_ds.flat_map(make_windows).shuffle(100).batch(batch_size, drop_remainder=True)
+    val_ds = val_ds.flat_map(make_windows).shuffle(100).batch(batch_size, drop_remainder=True)
+    test_ds = test_ds.flat_map(make_windows).shuffle(100).batch(batch_size, drop_remainder=True)
+
+    dataset = {
+        'train': train_ds,
+        'val': val_ds,
+        'test': test_ds
+    }
+
+    return dataset
 
 if __name__ == '__main__':
-    dataset = predictor_dataset_fn(10, 16, (256, 144), 1)
-    iter = dataset['train'].as_numpy_iterator()
-    # #0104a3f0-9294818d.mov
-    (inputs, output) = next(iter)
-    for i in range(10):
-        img = (inputs[0][i]*255).astype(np.uint8)
-        cv2.imshow('window', img)
-        cv2.waitKey(0)
-    img = (output[0] * 255).astype(np.uint8)
-    cv2.imshow('window', img)
-    cv2.waitKey(0)
-
     pass
+    # extract_jpgs(os.path.join('..', DATA_PATH, 'train'))
+    # extract_jpgs(os.path.join('..', DATA_PATH, 'val'))
+    # extract_jpgs(os.path.join('..', DATA_PATH, 'test'))
+
+    # ds_splits = dataset_from_jpgs(1, 8)
+    #
+    # ds_train = ds_splits['train']
+    # ds_val = ds_splits['val']
+    # ds_test = ds_splits['test']
+    #
+    # ds_list = ds_train.as_numpy_iterator()
+    # while input() != 'q':
+    #     x, y = next(ds_list)
+    #     print((x.shape, y.shape))
+    #     concat = tf.concat([x[0], y], 0)
+    #     plot_frames(concat)
+
+
